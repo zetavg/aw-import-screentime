@@ -201,17 +201,55 @@ class ActivityWatchSink:
 
     def emit(self, bucket: str, events: Sequence[Event]) -> int:
         """
-        Insert events into the given ActivityWatch bucket.
+        Insert events into the given ActivityWatch bucket, skipping duplicates.
+
+        Queries the server for existing events in the time range first,
+        then only inserts events whose (timestamp, duration, app) key
+        is not already present.
 
         Returns:
-            The number of events inserted.
+            The number of new events inserted.
         """
         if not events:
             return 0
-        # Insert all events in a single call (explicit list to avoid generator reuse).
-        self.client.insert_events(bucket, list(events))
-        logger.info("Inserted %d events into %s", len(events), bucket)
-        return len(events)
+
+        # Determine the time range spanned by the new events.
+        start = min(e.timestamp for e in events)
+        end = max(
+            e.timestamp + (e.duration or timedelta(0)) for e in events
+        )
+
+        # Fetch existing events in that range from the server.
+        existing = self.client.get_events(bucket, start=start, end=end, limit=-1)
+        existing_keys: set[tuple[datetime, timedelta | None, str | None]] = {
+            (e.timestamp, e.duration, e.data.get("app") if isinstance(e.data, dict) else None)
+            for e in existing
+        }
+
+        new_events = [
+            e
+            for e in events
+            if (e.timestamp, e.duration, e.data.get("app") if isinstance(e.data, dict) else None)
+            not in existing_keys
+        ]
+
+        if not new_events:
+            logger.info(
+                "No new events to insert into %s (all %d already exist)",
+                bucket,
+                len(events),
+            )
+            return 0
+
+        self.client.insert_events(bucket, new_events)
+        skipped = len(events) - len(new_events)
+        logger.info(
+            "Inserted %d new events into %s (%d skipped as duplicates)",
+            len(new_events),
+            bucket,
+            skipped,
+        )
+        return len(new_events)
 
 
 class NullSink:
